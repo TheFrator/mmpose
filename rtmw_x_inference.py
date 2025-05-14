@@ -35,14 +35,17 @@ INPUT_DIR = r"mmpose_sample\input_images"
 OUTPUT_DIR = r"mmpose_sample\output"
 OUTPUT_JSON = os.path.join(OUTPUT_DIR, "rtmw-x_keypoint_detections.json")
 VIS_DIR = os.path.join(OUTPUT_DIR, "visualizations")
+TARGET_AREA_VIS_DIR = os.path.join(OUTPUT_DIR, "target_area_visible")  # New directory for target area visualizations
 
 # Create output directories if they don't exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(VIS_DIR, exist_ok=True)
+os.makedirs(TARGET_AREA_VIS_DIR, exist_ok=True)  # Create new target area visualization directory
 
 logger.info(f"Input directory: {INPUT_DIR}")
 logger.info(f"Output directory: {OUTPUT_DIR}")
 logger.info(f"Visualization directory: {VIS_DIR}")
+logger.info(f"Target area visualization directory: {TARGET_AREA_VIS_DIR}")
 
 # Verify directory permissions
 try:
@@ -155,6 +158,63 @@ for img_idx, image_path in enumerate(image_files):
         # Add image data to output
         output_data.append(image_data)
         
+        # Draw target area polygons on the image
+        try:
+            # Load a fresh copy of the original image for drawing target areas
+            img_for_drawing = cv2.imread(image_path)
+            if img_for_drawing is None:
+                logger.error(f"Failed to load image {image_path} for target area visualization")
+                continue
+            
+            # Draw target areas for each person
+            for person in image_data["persons"]:
+                for area in person["target_areas"]:
+                    # Convert polygon to proper format for OpenCV drawing
+                    pts = np.array(area["polygon"], dtype=np.int32).reshape((-1, 1, 2))
+                    
+                    # Generate a color based on the region name (for variety)
+                    # This creates different colors for different body regions
+                    region_hash = hash(area["region_name"]) % 255
+                    color = (region_hash, 255, 255 - region_hash)
+                    
+                    # Draw filled polygon with transparency
+                    overlay = img_for_drawing.copy()
+                    cv2.fillPoly(overlay, [pts], color)
+                    # Apply the overlay with transparency
+                    alpha = 0.3  # Transparency factor
+                    cv2.addWeighted(overlay, alpha, img_for_drawing, 1 - alpha, 0, img_for_drawing)
+                    
+                    # Draw polygon outline
+                    cv2.polylines(img_for_drawing, [pts], isClosed=True, color=(0, 0, 0), thickness=2)
+                    
+                    # Calculate centroid for text position
+                    centroid_x = int(sum(p[0] for p in area["polygon"]) / len(area["polygon"]))
+                    centroid_y = int(sum(p[1] for p in area["polygon"]) / len(area["polygon"]))
+                    
+                    # Format text with region name and confidence score
+                    text = f'{area["region_name"]}: {area["confidence_score"]:.2f}'
+                    
+                    # Draw text background for better visibility
+                    text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    text_w, text_h = text_size
+                    cv2.rectangle(img_for_drawing, 
+                                 (centroid_x - 5, centroid_y - text_h - 5),
+                                 (centroid_x + text_w + 5, centroid_y + 5),
+                                 (255, 255, 255), -1)
+                    
+                    # Draw text
+                    cv2.putText(img_for_drawing, text, (centroid_x, centroid_y), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            
+            # Save the annotated image
+            output_image_path = os.path.join(TARGET_AREA_VIS_DIR, img_name)
+            cv2.imwrite(output_image_path, img_for_drawing)
+            logger.info(f"Target area visualization saved to {output_image_path}")
+            
+        except Exception as draw_err:
+            logger.error(f"Error drawing target areas for {img_name}: {str(draw_err)}")
+            logger.error(traceback.format_exc())
+        
         # Generate and explicitly save visualization for this image
         logger.info(f"Generating visualization for {img_name}")
         vis_file_path = os.path.join(VIS_DIR, img_name)
@@ -220,6 +280,13 @@ if len(vis_files) != len(image_files):
     if vis_files:
         logger.info(f"Sample visualization files: {vis_files[:min(5, len(vis_files))]}")
 
+# Check on target area visualizations
+target_area_vis_files = [f for f in os.listdir(TARGET_AREA_VIS_DIR) if os.path.isfile(os.path.join(TARGET_AREA_VIS_DIR, f))]
+logger.info(f"Total target area visualization files saved: {len(target_area_vis_files)}")
+if len(target_area_vis_files) != len(image_files):
+    logger.warning(f"Number of target area visualization files ({len(target_area_vis_files)}) does not match number of input images ({len(image_files)})")
+
 logger.info(f"Processing complete!")
 logger.info(f"Results saved to {OUTPUT_JSON}")
 logger.info(f"Visualizations saved to {VIS_DIR}")
+logger.info(f"Target area visualizations saved to {TARGET_AREA_VIS_DIR}")
