@@ -17,6 +17,8 @@ import numpy as np
 import cv2
 from mmpose.apis import MMPoseInferencer
 
+from limb_polygon import generate_target_areas
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -146,6 +148,7 @@ for img_idx, image_path in enumerate(image_files):
                         float(y2 - y1)   # height
                     ]
                 
+                person_data["target_areas"] = generate_target_areas(person_data["keypoints"], confidence_threshold=0.3)
                 # Add person to image data
                 image_data["persons"].append(person_data)
         
