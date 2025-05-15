@@ -187,12 +187,14 @@ def create_neck_polygon(keypoints, confidence_threshold=0.4):
     
     return vertices, float(avg_confidence)
 
-def create_improved_head_polygon(keypoints, confidence_threshold=0.4):
+def create_improved_head_polygon(keypoints, person_bbox=None, confidence_threshold=0.4):
     """
-    Create an improved head polygon using facial landmarks and elliptical fitting.
+    Create an improved head polygon using facial landmarks, elliptical fitting,
+    and person bounding box information.
     
     Args:
         keypoints: List of [x, y, confidence] keypoints in COCO-WholeBody format
+        person_bbox: Optional [x1, y1, width, height] representing the person's bounding box
         confidence_threshold: Minimum confidence to include a keypoint
         
     Returns:
@@ -217,6 +219,8 @@ def create_improved_head_polygon(keypoints, confidence_threshold=0.4):
     
     # Determine head orientation (frontal vs profile)
     is_profile = False
+    left_ear_conf = 0.0
+    right_ear_conf = 0.0
     if 3 < len(keypoints) and 4 < len(keypoints):  # Check if ears are detected
         left_ear_conf = keypoints[3][2]
         right_ear_conf = keypoints[4][2]
@@ -247,6 +251,11 @@ def create_improved_head_polygon(keypoints, confidence_threshold=0.4):
     
     # Convert to numpy array for calculations
     points_array = np.array(final_points)
+    
+    # Cranium points (top of head)
+    top_center = None
+    top_left = None
+    top_right = None
     
     # Estimate top of head if possible
     if 1 < len(keypoints) and 2 < len(keypoints):  # Check if eyes are detected
@@ -290,13 +299,117 @@ def create_improved_head_polygon(keypoints, confidence_threshold=0.4):
                     top_left = np.array([top_center[0] - side_offset, top_center[1] + side_offset * 0.5])
                     top_right = np.array([top_center[0] + side_offset, top_center[1] + side_offset * 0.5])
                 
-                # Add cranium points
-                final_points.append((top_center[0], top_center[1]))
-                final_points.append((top_left[0], top_left[1]))
-                final_points.append((top_right[0], top_right[1]))
+                # NEW: Constraining top of head to the bounding box (if provided)
+                if person_bbox is not None:
+                    # Add a small padding (2 pixels) to avoid clipping exactly at the bbox edge
+                    bbox_top = person_bbox[1] + 2  
+                    
+                    # Adjust top_center if it extends beyond the bbox
+                    if top_center[1] < bbox_top:
+                        top_center[1] = bbox_top
+                    
+                    # Adjust top_left if it extends beyond the bbox
+                    if top_left is not None and top_left[1] < bbox_top:
+                        top_left[1] = bbox_top
+                    
+                    # Adjust top_right if it extends beyond the bbox
+                    if top_right is not None and top_right[1] < bbox_top:
+                        top_right[1] = bbox_top
+                
+                # Add cranium points to final points
+                if top_center is not None:
+                    final_points.append((top_center[0], top_center[1]))
+                if top_left is not None:
+                    final_points.append((top_left[0], top_left[1]))
+                if top_right is not None:
+                    final_points.append((top_right[0], top_right[1]))
+    
+    # NEW: Adapt head polygon shape based on proximity to bounding box sides
+    if person_bbox is not None:
+        # Determine which side the head is facing
+        facing_left = False
+        facing_right = False
+        
+        # Use ears to determine head orientation if available
+        if 3 < len(keypoints) and 4 < len(keypoints):
+            left_ear = np.array([keypoints[3][0], keypoints[3][1]]) if keypoints[3][2] >= confidence_threshold else None
+            right_ear = np.array([keypoints[4][0], keypoints[4][1]]) if keypoints[4][2] >= confidence_threshold else None
+            
+            # Check left ear proximity to left bbox edge
+            if left_ear is not None:
+                left_dist = left_ear[0] - person_bbox[0]
+                facing_left = left_dist < 0.3 * person_bbox[2]  # If left ear is within 30% of bbox width from left edge
+            
+            # Check right ear proximity to right bbox edge
+            if right_ear is not None:
+                right_dist = (person_bbox[0] + person_bbox[2]) - right_ear[0]
+                facing_right = right_dist < 0.3 * person_bbox[2]  # If right ear is within 30% of bbox width from right edge
+            
+            # If both ears are detected, use confidence to decide
+            if left_ear is not None and right_ear is not None:
+                if left_ear_conf > right_ear_conf + 0.3:
+                    facing_left = True
+                    facing_right = False
+                elif right_ear_conf > left_ear_conf + 0.3:
+                    facing_right = True
+                    facing_left = False
+        
+        # If ear detection inconclusive, use nose and eye positions (if available)
+        if not (facing_left or facing_right) and 0 < len(keypoints) and keypoints[0][2] >= confidence_threshold:
+            nose = np.array([keypoints[0][0], keypoints[0][1]])
+            
+            # Determine if nose is significantly off-center
+            bbox_center_x = person_bbox[0] + person_bbox[2] / 2
+            nose_offset = (nose[0] - bbox_center_x) / person_bbox[2]  # Normalized offset
+            
+            if nose_offset < -0.15:  # Nose is more than 15% left of center
+                facing_left = True
+            elif nose_offset > 0.15:  # Nose is more than 15% right of center
+                facing_right = True
+        
+        # Add points to extend the head polygon towards the dominant side
+        if facing_left or facing_right:
+            # Find extremes in current points
+            if final_points:
+                points_array = np.array(final_points)
+                min_x = points_array[:, 0].min()
+                max_x = points_array[:, 0].max()
+                min_y = points_array[:, 1].min()
+                max_y = points_array[:, 1].max()
+                
+                # Find a representative y-coordinate for the side of the head
+                # (halfway between the top and bottom of the current points)
+                mid_y = (min_y + max_y) / 2
+                
+                # Add padding to stay slightly inside the bbox (3 pixels)
+                bbox_padding = 3
+                
+                if facing_left:
+                    # Find the leftmost point's x-coordinate
+                    # Don't extend beyond the bbox left edge
+                    left_edge = max(person_bbox[0] + bbox_padding, min_x - person_bbox[2] * 0.05)
+                    
+                    # Add points to extend the left side of the head
+                    # Add points at multiple heights to create a smoother side profile
+                    side_heights = [min_y + (max_y - min_y) * h for h in [0.25, 0.5, 0.75]]
+                    for side_y in side_heights:
+                        final_points.append((left_edge, side_y))
+                
+                if facing_right:
+                    # Find the rightmost point's x-coordinate
+                    # Don't extend beyond the bbox right edge
+                    right_edge = min(person_bbox[0] + person_bbox[2] - bbox_padding, max_x + person_bbox[2] * 0.05)
+                    
+                    # Add points to extend the right side of the head
+                    # Add points at multiple heights to create a smoother side profile
+                    side_heights = [min_y + (max_y - min_y) * h for h in [0.25, 0.5, 0.75]]
+                    for side_y in side_heights:
+                        final_points.append((right_edge, side_y))
+    
+    # Recalculate points_array after all modifications
+    points_array = np.array(final_points)
     
     # Calculate convex hull with final points
-    points_array = np.array(final_points)
     hull = ConvexHull(points_array)
     
     # Extract vertices
@@ -317,6 +430,7 @@ def create_improved_head_polygon(keypoints, confidence_threshold=0.4):
     avg_confidence = np.mean(valid_face_confidences) if valid_face_confidences else 0.0
     
     return expanded_vertices, float(avg_confidence)
+
 
 def create_improved_neck_polygon(keypoints, head_polygon=None, confidence_threshold=0.4):
     """
@@ -725,7 +839,7 @@ def create_improved_foot_polygon(keypoints, foot_indices, is_left=True, confiden
     
     return vertices, float(avg_confidence)
 
-def generate_target_areas(keypoints, confidence_threshold=0.4):
+def generate_target_areas(keypoints, person_bbox = None, confidence_threshold=0.4):
     """
     Generate all body region polygons from the keypoints with improved anatomical accuracy.
     
@@ -739,7 +853,7 @@ def generate_target_areas(keypoints, confidence_threshold=0.4):
     target_areas = []
     
     # Improved Head
-    head_polygon, head_confidence = create_improved_head_polygon(keypoints, confidence_threshold)
+    head_polygon, head_confidence = create_improved_head_polygon(keypoints, person_bbox, confidence_threshold)
     if head_polygon:
         target_areas.append({
             "region_name": "Head",

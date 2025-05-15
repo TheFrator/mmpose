@@ -151,7 +151,10 @@ for img_idx, image_path in enumerate(image_files):
                         float(y2 - y1)   # height
                     ]
                 
-                person_data["target_areas"] = generate_target_areas(person_data["keypoints"], confidence_threshold=3)
+                person_data["target_areas"] = generate_target_areas(
+                person_data["keypoints"], 
+                person_bbox=person_data.get("bbox"),  # Pass the bbox if available
+                confidence_threshold=3.0)
                 # Add person to image data
                 image_data["persons"].append(person_data)
         
