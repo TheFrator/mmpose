@@ -187,9 +187,547 @@ def create_neck_polygon(keypoints, confidence_threshold=0.4):
     
     return vertices, float(avg_confidence)
 
+def create_improved_head_polygon(keypoints, confidence_threshold=0.4):
+    """
+    Create an improved head polygon using facial landmarks and elliptical fitting.
+    
+    Args:
+        keypoints: List of [x, y, confidence] keypoints in COCO-WholeBody format
+        confidence_threshold: Minimum confidence to include a keypoint
+        
+    Returns:
+        List of (x,y) vertices defining the polygon,
+        Average confidence score of the used keypoints
+    """
+    # Check if we have enough face keypoints
+    face_indices = [0, 1, 2, 3, 4] + list(range(23, 91))  # Nose, eyes, ears + face
+    jawline_indices = list(range(23, 32))  # Approximate jawline points
+    
+    # Filter valid keypoints
+    valid_face_points = []
+    valid_face_confidences = []
+    for idx in face_indices:
+        if idx < len(keypoints) and keypoints[idx][2] >= confidence_threshold:
+            valid_face_points.append((keypoints[idx][0], keypoints[idx][1]))
+            valid_face_confidences.append(keypoints[idx][2])
+    
+    # Check if we have enough points
+    if len(valid_face_points) < 3:
+        return None, 0.0
+    
+    # Determine head orientation (frontal vs profile)
+    is_profile = False
+    if 3 < len(keypoints) and 4 < len(keypoints):  # Check if ears are detected
+        left_ear_conf = keypoints[3][2]
+        right_ear_conf = keypoints[4][2]
+        # If one ear is significantly more visible than the other, it's likely a profile view
+        if abs(left_ear_conf - right_ear_conf) > 0.3:
+            is_profile = True
+    
+    # Extract jawline points if available
+    jawline_points = []
+    for idx in jawline_indices:
+        if idx < len(keypoints) and keypoints[idx][2] >= confidence_threshold:
+            jawline_points.append((keypoints[idx][0], keypoints[idx][1]))
+    
+    # If we have enough jawline points, use them to define the lower part of the head
+    final_points = []
+    if len(jawline_points) >= 3:
+        final_points.extend(jawline_points)
+    
+    # Add eyes, nose, and ears with high confidence
+    for idx in [0, 1, 2, 3, 4]:  # Nose, eyes, ears
+        if idx < len(keypoints) and keypoints[idx][2] >= confidence_threshold + 0.1:  # Higher threshold
+            final_points.append((keypoints[idx][0], keypoints[idx][1]))
+    
+    # Check if we have enough points for a polygon
+    if len(final_points) < 3:
+        # Fall back to using all face points
+        final_points = valid_face_points
+    
+    # Convert to numpy array for calculations
+    points_array = np.array(final_points)
+    
+    # Estimate top of head if possible
+    if 1 < len(keypoints) and 2 < len(keypoints):  # Check if eyes are detected
+        left_eye = np.array([keypoints[1][0], keypoints[1][1]])
+        right_eye = np.array([keypoints[2][0], keypoints[2][1]])
+        eye_center = (left_eye + right_eye) / 2
+        
+        # Estimate face height
+        if 0 < len(keypoints) and keypoints[0][2] >= confidence_threshold:  # Nose
+            nose = np.array([keypoints[0][0], keypoints[0][1]])
+            face_height = 0
+            
+            # If we have jawline points, use the lowest point
+            if jawline_points:
+                jaw_y = max(p[1] for p in jawline_points)
+                face_height = jaw_y - min(left_eye[1], right_eye[1])
+            else:
+                # Rough estimate based on eyes to nose
+                face_height = abs(nose[1] - min(left_eye[1], right_eye[1])) * 2
+            
+            # Estimate top of head
+            if face_height > 0:
+                # Head height is approximately 1.3 times face height
+                head_height = face_height * 1.3
+                # Create points for top of head
+                top_center = np.array([eye_center[0], eye_center[1] - head_height * 0.7])
+                
+                # Add more points to create a realistic cranium shape
+                if is_profile:
+                    # For profile view, add points to create a curved top
+                    side_offset = head_height * 0.25
+                    if left_ear_conf > right_ear_conf:  # Left profile
+                        top_left = np.array([top_center[0] - side_offset, top_center[1] + side_offset * 0.5])
+                        top_right = np.array([top_center[0] + side_offset * 0.8, top_center[1] + side_offset * 0.3])
+                    else:  # Right profile
+                        top_left = np.array([top_center[0] - side_offset * 0.8, top_center[1] + side_offset * 0.3])
+                        top_right = np.array([top_center[0] + side_offset, top_center[1] + side_offset * 0.5])
+                else:
+                    # For frontal view, create a curved top
+                    side_offset = head_height * 0.3
+                    top_left = np.array([top_center[0] - side_offset, top_center[1] + side_offset * 0.5])
+                    top_right = np.array([top_center[0] + side_offset, top_center[1] + side_offset * 0.5])
+                
+                # Add cranium points
+                final_points.append((top_center[0], top_center[1]))
+                final_points.append((top_left[0], top_left[1]))
+                final_points.append((top_right[0], top_right[1]))
+    
+    # Calculate convex hull with final points
+    points_array = np.array(final_points)
+    hull = ConvexHull(points_array)
+    
+    # Extract vertices
+    vertices = [points_array[idx].tolist() for idx in hull.vertices]
+    
+    # Apply expansion factor for hair and accessories
+    centroid = np.mean(points_array, axis=0)
+    expanded_vertices = []
+    for vertex in vertices:
+        # Vector from centroid to vertex
+        direction = np.array(vertex) - centroid
+        # Scale by expansion factor
+        expansion_factor = 1.07  # 7% expansion
+        expanded_vertex = centroid + direction * expansion_factor
+        expanded_vertices.append(expanded_vertex.tolist())
+    
+    # Calculate average confidence score
+    avg_confidence = np.mean(valid_face_confidences) if valid_face_confidences else 0.0
+    
+    return expanded_vertices, float(avg_confidence)
+
+def create_improved_neck_polygon(keypoints, head_polygon=None, confidence_threshold=0.4):
+    """
+    Create an improved neck polygon using anatomically guided proportions.
+    
+    Args:
+        keypoints: List of [x, y, confidence] keypoints
+        head_polygon: Optional head polygon to ensure no overlap
+        confidence_threshold: Minimum confidence to include a keypoint
+        
+    Returns:
+        List of (x,y) vertices defining the polygon,
+        Average confidence score of the used keypoints
+    """
+    # Check if required keypoints are available
+    required_indices = [3, 4, 5, 6]  # Left ear, Right ear, Left shoulder, Right shoulder
+    valid_confidences = []
+    for idx in required_indices:
+        if idx >= len(keypoints) or keypoints[idx][2] < confidence_threshold:
+            return None, 0.0
+        valid_confidences.append(keypoints[idx][2])
+    
+    # Get key points
+    left_ear = np.array([keypoints[3][0], keypoints[3][1]])
+    right_ear = np.array([keypoints[4][0], keypoints[4][1]])
+    left_shoulder = np.array([keypoints[5][0], keypoints[5][1]])
+    right_shoulder = np.array([keypoints[6][0], keypoints[6][1]])
+    
+    # Calculate shoulder width and other anatomical proportions
+    shoulder_width = np.linalg.norm(right_shoulder - left_shoulder)
+    shoulder_midpoint = (left_shoulder + right_shoulder) / 2
+    
+    # Determine head orientation
+    is_profile = False
+    left_ear_conf = keypoints[3][2]
+    right_ear_conf = keypoints[4][2]
+    if abs(left_ear_conf - right_ear_conf) > 0.3:
+        is_profile = True
+    
+    # Calculate rotation angle for head
+    rotation_angle = 0
+    if left_ear_conf > confidence_threshold and right_ear_conf > confidence_threshold:
+        rotation_angle = np.arctan2(right_ear[1] - left_ear[1], right_ear[0] - left_ear[0])
+    
+    # Neck width should be around 60-70% of shoulder width at midpoint
+    neck_width_ratio = 0.65
+    neck_width = shoulder_width * neck_width_ratio
+    
+    # Estimate neck length (approximately 1/3 of the distance from shoulders to top of head)
+    # Since we don't know the exact top of head, we'll use ears and add some offset
+    ears_midpoint = (left_ear + right_ear) / 2
+    est_neck_length = np.linalg.norm(shoulder_midpoint - ears_midpoint) * 0.6
+    
+    # Create neck top points (just below the jawline/ears)
+    # We'll calculate these relative to the ears but lower
+    neck_top_offset_y = est_neck_length * 0.2  # 20% down from ears
+    
+    # Adjust based on head orientation
+    if is_profile:
+        # For profile view, adjust the neck width
+        if left_ear_conf > right_ear_conf:  # Left profile
+            dominant_ear = left_ear
+            dominant_shoulder = left_shoulder
+        else:  # Right profile
+            dominant_ear = right_ear
+            dominant_shoulder = right_shoulder
+        
+        # Create neck top points with profile orientation
+        neck_vector = dominant_shoulder - dominant_ear
+        neck_length = np.linalg.norm(neck_vector) * 0.4
+        neck_direction = neck_vector / np.linalg.norm(neck_vector)
+        
+        # Create top of neck points
+        neck_top_center = dominant_ear + neck_direction * neck_length * 0.3
+        neck_width_profile = neck_width * 0.8  # Narrower for profile
+        
+        # Create perpendicular vector for width
+        perp_vector = np.array([-neck_direction[1], neck_direction[0]])
+        
+        # Neck top points
+        left_neck_top = neck_top_center - perp_vector * neck_width_profile * 0.5
+        right_neck_top = neck_top_center + perp_vector * neck_width_profile * 0.5
+    else:
+        # For frontal view, create a more standard trapezoid
+        # Apply rotation if head is tilted
+        if rotation_angle != 0:
+            # Create rotation matrix
+            cos_rot = np.cos(rotation_angle)
+            sin_rot = np.sin(rotation_angle)
+            rot_matrix = np.array([[cos_rot, -sin_rot], [sin_rot, cos_rot]])
+            
+            # Create neck top width vector with rotation
+            neck_top_width_vector = rot_matrix.dot(np.array([neck_width * 0.8 / 2, 0]))
+            
+            # Create neck top center
+            neck_top_center = np.array([
+                (left_ear[0] + right_ear[0]) / 2,
+                (left_ear[1] + right_ear[1]) / 2 + neck_top_offset_y
+            ])
+            
+            # Create neck top points
+            left_neck_top = neck_top_center - neck_top_width_vector
+            right_neck_top = neck_top_center + neck_top_width_vector
+        else:
+            # Without rotation, use a simpler approach
+            left_neck_top = np.array([
+                left_ear[0] + (left_shoulder[0] - left_ear[0]) * 0.3,
+                left_ear[1] + (left_shoulder[1] - left_ear[1]) * 0.3
+            ])
+            right_neck_top = np.array([
+                right_ear[0] + (right_shoulder[0] - right_ear[0]) * 0.3,
+                right_ear[1] + (right_shoulder[1] - right_ear[1]) * 0.3
+            ])
+    
+    # Check if the head polygon is provided to ensure no overlap
+    if head_polygon and len(head_polygon) > 2:
+        # Find the lowest point of the head polygon
+        head_bottom_y = max(p[1] for p in head_polygon)
+        
+        # Ensure neck top points are below the head bottom
+        if left_neck_top[1] < head_bottom_y:
+            left_neck_top[1] = head_bottom_y + 1
+        if right_neck_top[1] < head_bottom_y:
+            right_neck_top[1] = head_bottom_y + 1
+    
+    # Return vertices in clockwise order
+    vertices = [
+        left_neck_top.tolist(),
+        right_neck_top.tolist(),
+        right_shoulder.tolist(),
+        left_shoulder.tolist()
+    ]
+    
+    # Calculate average confidence
+    avg_confidence = np.mean(valid_confidences) if valid_confidences else 0.0
+    
+    return vertices, float(avg_confidence)
+
+def create_improved_lower_torso_polygon(keypoints, confidence_threshold=0.4):
+    """
+    Create an improved lower torso polygon using body-specific proportions.
+    
+    Args:
+        keypoints: List of [x, y, confidence] keypoints
+        confidence_threshold: Minimum confidence to include a keypoint
+        
+    Returns:
+        List of (x,y) vertices defining the polygon,
+        Average confidence score of the used keypoints
+    """
+    # Check if required keypoints are available
+    required_indices = [5, 6, 11, 12]  # Shoulders and hips
+    valid_confidences = []
+    for idx in required_indices:
+        if idx >= len(keypoints) or keypoints[idx][2] < confidence_threshold:
+            return None, 0.0
+        valid_confidences.append(keypoints[idx][2])
+    
+    # Get key points
+    left_shoulder = np.array([keypoints[5][0], keypoints[5][1]])
+    right_shoulder = np.array([keypoints[6][0], keypoints[6][1]])
+    left_hip = np.array([keypoints[11][0], keypoints[11][1]])
+    right_hip = np.array([keypoints[12][0], keypoints[12][1]])
+    
+    # Calculate body proportions
+    shoulder_width = np.linalg.norm(right_shoulder - left_shoulder)
+    hip_width = np.linalg.norm(right_hip - left_hip)
+    torso_height = np.linalg.norm((left_shoulder + right_shoulder) / 2 - (left_hip + right_hip) / 2)
+    
+    # Calculate midpoints
+    shoulder_midpoint = (left_shoulder + right_shoulder) / 2
+    hip_midpoint = (left_hip + right_hip) / 2
+    
+    # Infer lower rib points (approximately 60% down from shoulders to hips)
+    lower_rib_factor = 0.6
+    lower_rib_left = left_shoulder + (left_hip - left_shoulder) * lower_rib_factor
+    lower_rib_right = right_shoulder + (right_hip - right_shoulder) * lower_rib_factor
+    
+    # Calculate waist points (approximately 75% down from shoulders to hips)
+    waist_factor = 0.75
+    waist_left = left_shoulder + (left_hip - left_shoulder) * waist_factor
+    waist_right = right_shoulder + (right_hip - right_shoulder) * waist_factor
+    
+    # Calculate waist width ratio (typically narrower than shoulders and hips)
+    # Use confidence-weighted approach
+    shoulder_conf = (keypoints[5][2] + keypoints[6][2]) / 2
+    hip_conf = (keypoints[11][2] + keypoints[12][2]) / 2
+    
+    if shoulder_conf > 0 and hip_conf > 0:
+        waist_width_factor = (shoulder_width * shoulder_conf + hip_width * hip_conf) / (shoulder_conf + hip_conf)
+        waist_width_factor *= 0.85  # Waist is typically narrower
+    else:
+        waist_width_factor = (shoulder_width + hip_width) / 2 * 0.85
+    
+    # Adjust waist points based on calculated width
+    waist_mid = (waist_left + waist_right) / 2
+    waist_dir = waist_right - waist_left
+    waist_dir_norm = waist_dir / np.linalg.norm(waist_dir)
+    waist_new_half_width = waist_width_factor / 2
+    
+    waist_left_adjusted = waist_mid - waist_dir_norm * waist_new_half_width
+    waist_right_adjusted = waist_mid + waist_dir_norm * waist_new_half_width
+    
+    # Define torso lower polygon (from lower ribs to top of iliac crests/hips)
+    vertices = [
+        lower_rib_left.tolist(),
+        lower_rib_right.tolist(),
+        waist_right_adjusted.tolist(),
+        waist_left_adjusted.tolist()
+    ]
+    
+    # Calculate average confidence
+    avg_confidence = np.mean(valid_confidences)
+    
+    return vertices, float(avg_confidence)
+
+def create_improved_pelvis_polygon(keypoints, confidence_threshold=0.4):
+    """
+    Create an improved pelvis polygon using anatomical landmark inference.
+    
+    Args:
+        keypoints: List of [x, y, confidence] keypoints
+        confidence_threshold: Minimum confidence to include a keypoint
+        
+    Returns:
+        List of (x,y) vertices defining the polygon,
+        Average confidence score of the used keypoints
+    """
+    # Check if required keypoints are available
+    required_indices = [11, 12, 13, 14]  # Hips and knees
+    valid_confidences = []
+    for idx in required_indices:
+        if idx >= len(keypoints) or keypoints[idx][2] < confidence_threshold:
+            return None, 0.0
+        valid_confidences.append(keypoints[idx][2])
+    
+    # Get key points
+    left_hip = np.array([keypoints[11][0], keypoints[11][1]])
+    right_hip = np.array([keypoints[12][0], keypoints[12][1]])
+    left_knee = np.array([keypoints[13][0], keypoints[13][1]])
+    right_knee = np.array([keypoints[14][0], keypoints[14][1]])
+    
+    # Calculate hip width
+    hip_width = np.linalg.norm(right_hip - left_hip)
+    hip_midpoint = (left_hip + right_hip) / 2
+    
+    # Infer ASIS (anterior superior iliac spine) points
+    # Typically slightly above and outward from hip keypoints
+    asis_offset_y = hip_width * 0.05  # Upward offset
+    asis_offset_x = hip_width * 0.08  # Outward offset
+    
+    left_asis = np.array([
+        left_hip[0] - asis_offset_x,
+        left_hip[1] - asis_offset_y
+    ])
+    
+    right_asis = np.array([
+        right_hip[0] + asis_offset_x,
+        right_hip[1] - asis_offset_y
+    ])
+    
+    # Infer pubic symphysis position
+    # Typically centered between hip keypoints and below
+    pubic_offset_y = hip_width * 0.12  # Downward offset
+    pubic_symphysis = np.array([
+        hip_midpoint[0],
+        hip_midpoint[1] + pubic_offset_y
+    ])
+    
+    # Calculate iliofemoral paths (from ASIS toward proximal thigh)
+    # This connects the pelvis to the upper thigh
+    thigh_factor = 0.25  # How far down the thigh to extend
+    
+    left_thigh_vector = left_knee - left_hip
+    left_iliofemoral = left_hip + left_thigh_vector * thigh_factor
+    
+    right_thigh_vector = right_knee - right_hip
+    right_iliofemoral = right_hip + right_thigh_vector * thigh_factor
+    
+    # Construct polygon vertices
+    # Format: ASIS left, ASIS right, iliofemoral right, pubic symphysis, iliofemoral left
+    vertices = [
+        left_asis.tolist(),
+        right_asis.tolist(),
+        right_iliofemoral.tolist(),
+        pubic_symphysis.tolist(),
+        left_iliofemoral.tolist()
+    ]
+    
+    # Calculate average confidence
+    avg_confidence = np.mean(valid_confidences)
+    
+    return vertices, float(avg_confidence)
+
+def create_improved_foot_polygon(keypoints, foot_indices, is_left=True, confidence_threshold=0.4):
+    """
+    Create an improved foot polygon using ankle, big toe, small toe, and heel keypoints.
+    
+    Args:
+        keypoints: List of [x, y, confidence] keypoints
+        foot_indices: List of indices for this foot's keypoints
+        is_left: Boolean indicating if this is the left foot
+        confidence_threshold: Minimum confidence to include a keypoint
+        
+    Returns:
+        List of (x,y) vertices defining the polygon,
+        Average confidence score of the used keypoints
+    """
+    # Filter valid points
+    valid_points = []
+    valid_confidences = []
+    for idx in foot_indices:
+        if idx < len(keypoints) and keypoints[idx][2] >= confidence_threshold:
+            valid_points.append((keypoints[idx][0], keypoints[idx][1]))
+            valid_confidences.append(keypoints[idx][2])
+    
+    # Need at least 3 points for a polygon
+    if len(valid_points) < 3:
+        return None, 0.0
+    
+    # Extract specific keypoints if available
+    ankle = None
+    big_toe = None
+    small_toe = None
+    heel = None
+    
+    # For left foot: ankle=15, big_toe=17, small_toe=18, heel=19
+    # For right foot: ankle=16, big_toe=20, small_toe=21, heel=22
+    if is_left:
+        if 15 < len(keypoints) and keypoints[15][2] >= confidence_threshold:
+            ankle = np.array([keypoints[15][0], keypoints[15][1]])
+        if 17 < len(keypoints) and keypoints[17][2] >= confidence_threshold:
+            big_toe = np.array([keypoints[17][0], keypoints[17][1]])
+        if 18 < len(keypoints) and keypoints[18][2] >= confidence_threshold:
+            small_toe = np.array([keypoints[18][0], keypoints[18][1]])
+        if 19 < len(keypoints) and keypoints[19][2] >= confidence_threshold:
+            heel = np.array([keypoints[19][0], keypoints[19][1]])
+    else:
+        if 16 < len(keypoints) and keypoints[16][2] >= confidence_threshold:
+            ankle = np.array([keypoints[16][0], keypoints[16][1]])
+        if 20 < len(keypoints) and keypoints[20][2] >= confidence_threshold:
+            big_toe = np.array([keypoints[20][0], keypoints[20][1]])
+        if 21 < len(keypoints) and keypoints[21][2] >= confidence_threshold:
+            small_toe = np.array([keypoints[21][0], keypoints[21][1]])
+        if 22 < len(keypoints) and keypoints[22][2] >= confidence_threshold:
+            heel = np.array([keypoints[22][0], keypoints[22][1]])
+    
+    # If we have all the specific points, create a more anatomically correct foot
+    final_points = []
+    
+    if ankle is not None and heel is not None:
+        # Add ankle and heel
+        final_points.append(ankle.tolist())
+        final_points.append(heel.tolist())
+        
+        # Add points to create the arch of the foot
+        ankle_to_heel = heel - ankle
+        ankle_heel_midpoint = ankle + ankle_to_heel * 0.5
+        # Create a point for the arch (inward from the midpoint)
+        arch_offset = np.array([ankle_to_heel[1], -ankle_to_heel[0]])
+        arch_offset = arch_offset / np.linalg.norm(arch_offset) * np.linalg.norm(ankle_to_heel) * 0.2
+        arch_point = ankle_heel_midpoint + arch_offset * (-1 if is_left else 1)
+        final_points.append(arch_point.tolist())
+    
+    # Add toe points
+    if big_toe is not None:
+        final_points.append(big_toe.tolist())
+    if small_toe is not None:
+        final_points.append(small_toe.tolist())
+    
+    # If we don't have enough specific points, fall back to convex hull
+    if len(final_points) < 3:
+        points_array = np.array(valid_points)
+        hull = ConvexHull(points_array)
+        vertices = [points_array[idx].tolist() for idx in hull.vertices]
+    else:
+        # Use the improved foot shape
+        # Sort points to form a proper polygon
+        if ankle is not None and (big_toe is not None or small_toe is not None):
+            # Sort based on angle from ankle to each point
+            center = ankle
+            def angle_from_center(point):
+                return np.arctan2(point[1] - center[1], point[0] - center[0])
+            
+            sorted_points = sorted(final_points, key=angle_from_center)
+            vertices = sorted_points
+        else:
+            # If we don't have ankle or toes, just use the points as is
+            vertices = final_points
+    
+    # Add a small expansion factor
+    if vertices:
+        centroid = np.mean(np.array(vertices), axis=0)
+        expanded_vertices = []
+        for vertex in vertices:
+            # Vector from centroid to vertex
+            direction = np.array(vertex) - centroid
+            # Scale by expansion factor
+            expansion_factor = 1.05  # 5% expansion
+            expanded_vertex = centroid + direction * expansion_factor
+            expanded_vertices.append(expanded_vertex.tolist())
+        vertices = expanded_vertices
+    
+    # Calculate average confidence
+    avg_confidence = np.mean(valid_confidences) if valid_confidences else 0.0
+    
+    return vertices, float(avg_confidence)
+
 def generate_target_areas(keypoints, confidence_threshold=0.4):
     """
-    Generate all body region polygons from the keypoints.
+    Generate all body region polygons from the keypoints with improved anatomical accuracy.
     
     Args:
         keypoints: List of [x, y, confidence] keypoints in COCO WholeBody format
@@ -200,9 +738,8 @@ def generate_target_areas(keypoints, confidence_threshold=0.4):
     """
     target_areas = []
     
-    # Head (using convex hull with face keypoints)
-    head_indices = [0, 1, 2, 3, 4] + list(range(23, 91))  # Nose, Eyes, Ears + Face keypoints
-    head_polygon, head_confidence = create_convex_hull_polygon(keypoints, head_indices, confidence_threshold)
+    # Improved Head
+    head_polygon, head_confidence = create_improved_head_polygon(keypoints, confidence_threshold)
     if head_polygon:
         target_areas.append({
             "region_name": "Head",
@@ -210,8 +747,8 @@ def generate_target_areas(keypoints, confidence_threshold=0.4):
             "confidence_score": head_confidence
         })
     
-    # Neck
-    neck_polygon, neck_confidence = create_neck_polygon(keypoints, confidence_threshold)
+    # Improved Neck - we pass the head polygon to avoid overlap
+    neck_polygon, neck_confidence = create_improved_neck_polygon(keypoints, head_polygon, confidence_threshold)
     if neck_polygon:
         target_areas.append({
             "region_name": "Neck",
@@ -219,7 +756,7 @@ def generate_target_areas(keypoints, confidence_threshold=0.4):
             "confidence_score": neck_confidence
         })
     
-    # Torso Upper (shoulders to hips)
+    # Torso Upper (shoulders to hips) - using existing function for now
     torso_upper_polygon, torso_upper_confidence = create_torso_polygon(
         keypoints, 5, 6, 12, 11, confidence_threshold
     )
@@ -230,45 +767,25 @@ def generate_target_areas(keypoints, confidence_threshold=0.4):
             "confidence_score": torso_upper_confidence
         })
     
-    # For Torso_Lower and Pelvis, we need to derive additional points
-    if torso_upper_polygon:
-        # Create a midpoint of the hips
-        hip_midpoint_x = (keypoints[11][0] + keypoints[12][0]) / 2
-        hip_midpoint_y = (keypoints[11][1] + keypoints[12][1]) / 2
-        
-        # Create points for torso lower (hip line and points lower)
-        lower_y_offset = 0.2 * abs(keypoints[5][1] - keypoints[11][1])  # 20% of torso height
-        
-        torso_lower_points = [
-            [keypoints[11][0], keypoints[11][1]],  # Left hip
-            [keypoints[12][0], keypoints[12][1]],  # Right hip
-            [keypoints[12][0], keypoints[12][1] + lower_y_offset],  # Lower right
-            [keypoints[11][0], keypoints[11][1] + lower_y_offset]   # Lower left
-        ]
-        torso_lower_confidence = (keypoints[11][2] + keypoints[12][2]) / 2
-        
+    # Improved Lower Torso
+    lower_torso_polygon, lower_torso_confidence = create_improved_lower_torso_polygon(keypoints, confidence_threshold)
+    if lower_torso_polygon:
         target_areas.append({
             "region_name": "Torso_Lower",
-            "polygon": torso_lower_points,
-            "confidence_score": float(torso_lower_confidence)
-        })
-        
-        # Create points for pelvis (below torso_lower)
-        pelvis_height = 0.15 * abs(keypoints[5][1] - keypoints[11][1])  # 15% of torso height
-        pelvis_points = [
-            [keypoints[11][0], keypoints[11][1] + lower_y_offset],  # Upper left
-            [keypoints[12][0], keypoints[12][1] + lower_y_offset],  # Upper right
-            [keypoints[12][0], keypoints[12][1] + lower_y_offset + pelvis_height],  # Lower right
-            [keypoints[11][0], keypoints[11][1] + lower_y_offset + pelvis_height]   # Lower left
-        ]
-        
-        target_areas.append({
-            "region_name": "Pelvis",
-            "polygon": pelvis_points,
-            "confidence_score": float(torso_lower_confidence)  # Same as torso_lower
+            "polygon": lower_torso_polygon,
+            "confidence_score": lower_torso_confidence
         })
     
-    # Arms
+    # Improved Pelvis
+    pelvis_polygon, pelvis_confidence = create_improved_pelvis_polygon(keypoints, confidence_threshold)
+    if pelvis_polygon:
+        target_areas.append({
+            "region_name": "Pelvis",
+            "polygon": pelvis_polygon,
+            "confidence_score": pelvis_confidence
+        })
+    
+    # Arms - using existing functions for now
     left_arm_upper_polygon, left_arm_upper_confidence = create_limb_polygon(
         keypoints, 5, 7, width_ratio=0.2, confidence_threshold=confidence_threshold
     )
@@ -309,7 +826,7 @@ def generate_target_areas(keypoints, confidence_threshold=0.4):
             "confidence_score": right_arm_lower_confidence
         })
     
-    # Hands (using convex hull)
+    # Hands - using existing functions for now
     left_hand_indices = list(range(91, 112))  # 21 left hand keypoints
     left_hand_polygon, left_hand_confidence = create_convex_hull_polygon(
         keypoints, left_hand_indices, confidence_threshold
@@ -332,7 +849,7 @@ def generate_target_areas(keypoints, confidence_threshold=0.4):
             "confidence_score": right_hand_confidence
         })
     
-    # Legs
+    # Legs - using existing functions for now
     left_leg_upper_polygon, left_leg_upper_confidence = create_limb_polygon(
         keypoints, 11, 13, width_ratio=0.3, confidence_threshold=confidence_threshold
     )
@@ -373,10 +890,10 @@ def generate_target_areas(keypoints, confidence_threshold=0.4):
             "confidence_score": right_leg_lower_confidence
         })
     
-    # Feet (using available ankle and foot keypoints)
-    left_foot_indices = [15, 17, 19, 21]  # Left ankle + foot keypoints
-    left_foot_polygon, left_foot_confidence = create_convex_hull_polygon(
-        keypoints, left_foot_indices, confidence_threshold
+    # Improved Feet
+    left_foot_indices = [15, 17, 18, 19]  # Left ankle, big toe, small toe, heel
+    left_foot_polygon, left_foot_confidence = create_improved_foot_polygon(
+        keypoints, left_foot_indices, is_left=True, confidence_threshold=confidence_threshold
     )
     if left_foot_polygon:
         target_areas.append({
@@ -385,9 +902,9 @@ def generate_target_areas(keypoints, confidence_threshold=0.4):
             "confidence_score": left_foot_confidence
         })
     
-    right_foot_indices = [16, 18, 20, 22]  # Right ankle + foot keypoints
-    right_foot_polygon, right_foot_confidence = create_convex_hull_polygon(
-        keypoints, right_foot_indices, confidence_threshold
+    right_foot_indices = [16, 20, 21, 22]  # Right ankle, big toe, small toe, heel
+    right_foot_polygon, right_foot_confidence = create_improved_foot_polygon(
+        keypoints, right_foot_indices, is_left=False, confidence_threshold=confidence_threshold
     )
     if right_foot_polygon:
         target_areas.append({
